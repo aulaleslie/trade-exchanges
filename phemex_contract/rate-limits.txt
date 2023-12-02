@@ -1,0 +1,25 @@
+Phemex clears remaining rate limit every start of minute (at 0 seconds of a minute)
+
+https://api.phemex.com/exchange/order?orderID=42e7838e-d511-4f34-886d-69ecbfc9d246&symbol=BTCUSD
+"X-Ratelimit-Capacity":[]string{"100"}
+
+https://api.phemex.com/exchange/order/list?limit=200&offset=0&start=1626202800000&symbol=BTCUSD
+"X-Ratelimit-Capacity":[]string{"100"}
+
+
+https://api.phemex.com/orders/activeList?symbol=BTCUSD
+"X-Ratelimit-Capacity-Contract":[]string{"500"}
+
+https://api.phemex.com/accounts/accountPositions?currency=BTC
+"X-Ratelimit-Capacity-Contract":[]string{"500"}
+
+POST https://api.phemex.com/orders
+"X-Ratelimit-Capacity-Contract":[]string{"500"},
+cost = 1
+
+https://api.phemex.com/orders/cancel?orderID=dad12b70-c15d-4502-9e22-525f15c47f7f&symbol=BTCUSD
+"X-Ratelimit-Capacity-Contract":[]string{"500"}
+
+https://api.phemex.com/exchange/public/products // used for scales
+< x-ratelimit-remaining: 99
+< x-ratelimit-capacity: 100

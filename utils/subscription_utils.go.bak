@@ -1,0 +1,413 @@
+package utils
+
+import (
+	"errors"
+	"log"
+	"sync"
+	"time"
+)
+
+type StreamEventMsg struct {
+	Topic string
+	Value interface{}
+}
+
+// Should be set one of `Err` or `Msg` or `Connected`
+// `Connected=true` means that connection were established. Should be sent for each reconnect/connect.
+type StreamEvent struct {
+	Err       error
+	Connected bool
+	Msg       *StreamEventMsg
+}
+
+// The stream should be closed by its internals after emiting error.
+// `cancel` is nil if erros is sent on opening.
+// Event with error can be sent only once.
+// Handler can be called only after returning channels.
+type OpenStreamFunc func(
+	handler func(StreamEvent),
+) (cancel chan<- struct{})
+
+// When we have stable connection for `attempsCleanDuration` dutation then the
+// internal `attempts` variable will be set to 0. Therefore attempts will be
+// calculated from this moment.
+// `subscribeToStream` function should return control immediately after connect.
+// Returns control after connect
+func OpenStreamWithRetry(
+	maxAttempts uint,
+	attemptsCleanDuration time.Duration,
+	waitBetweenTryings time.Duration,
+	handler func(StreamEvent),
+	openStream OpenStreamFunc,
+) (cancel chan<- struct{}) {
+	log.Print("OpenStreamWithRetry")
+	attempts := uint(0)
+
+	errorsChan := make(chan error, 1)
+	otherChan := make(chan StreamEvent, 1)
+	handlerInternal := func(se StreamEvent) {
+		switch {
+		case se.Err != nil:
+			errorsChan <- se.Err
+		case se.Connected || se.Msg != nil:
+			otherChan <- se
+		default:
+			panic("impossible")
+		}
+	}
+
+	attemptsCleanTimer := NewCancellableTimer()
+	var cancelInternal chan<- struct{}
+	cancelExternal := make(chan struct{}, 1)
+
+	isOpenedOrStopped := false
+	openResult := make(chan (chan struct{})) // returns `cancelExternal` or `nil`
+	returnIfTrue := func(check bool) {
+		if isOpenedOrStopped {
+			return
+		}
+		if check {
+			isOpenedOrStopped = true
+			openResult <- cancelExternal
+			close(openResult)
+		}
+	}
+	returnError := func() {
+		if isOpenedOrStopped {
+			return
+		}
+		isOpenedOrStopped = true
+		openResult <- nil
+		close(openResult)
+	}
+	go func() {
+		attempts++
+		cancelInternal = openStream(handlerInternal)
+		returnIfTrue(cancelInternal != nil)
+
+		attemptsCleanTimer.Start(attemptsCleanDuration)
+		for {
+			select {
+			case se := <-otherChan:
+				handler(se)
+			case err := <-errorsChan:
+				log.Print("[OpenStreamWithRetry] Error received")
+				attemptsCleanTimer.Stop()
+				log.Print("[OpenStreamWithRetry] Timer stopped")
+				if attempts >= maxAttempts {
+					log.Print("[OpenStreamWithRetry] Stopping: too much attempts")
+					returnError()
+					handler(StreamEvent{Err: err})
+					return
+				}
+				log.Printf("[OpenStreamWithRetry] Waiting for %v", waitBetweenTryings)
+				time.Sleep(waitBetweenTryings)
+
+				log.Print("[OpenStreamWithRetry] Making retry")
+				attempts++
+				cancelInternal = openStream(handlerInternal)
+				returnIfTrue(cancelInternal != nil)
+				attemptsCleanTimer.Start(attemptsCleanDuration)
+			case <-attemptsCleanTimer.C:
+				log.Print("[OpenStreamWithRetry] Cleaning attempts count")
+				attempts = 0
+			case <-cancelExternal:
+				log.Print("[OpenStreamWithRetry] Cancelling")
+				close(cancelInternal)
+				attemptsCleanTimer.Stop()
+				return
+			}
+		}
+	}()
+
+	return <-openResult
+}
+
+// `OpenStreamWithRetry` in functional style
+func OpenStreamWithRetryFn(
+	maxAttempts uint,
+	attemptsCleanDuration time.Duration,
+	waitBetweenTryings time.Duration,
+	openStream OpenStreamFunc,
+) OpenStreamFunc {
+	return func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		return OpenStreamWithRetry(
+			maxAttempts, attemptsCleanDuration, waitBetweenTryings,
+			h, openStream,
+		)
+	}
+}
+
+// The stream can be not closed after emitting error
+// `cancel` is nil if error is sent on opening.
+// Errors can be sent many times.
+// Handler can be called only after returning channels.
+type OpenStreamManyErrorsFunc func(
+	handler func(StreamEvent),
+) (cancel chan<- struct{})
+
+// Don't send any after sending first error
+func OpenStreamWithAtMostOneError(
+	openStreamManyErrors OpenStreamManyErrorsFunc,
+	handler func(StreamEvent),
+) (cancel chan<- struct{}) {
+	errorsReceivedMu := sync.RWMutex{}
+	errorsReceived := 0
+
+	errHandlerInternal := func(err error) {
+		errorsReceivedMu.Lock()
+		errorsReceived++
+		received := errorsReceived
+		errorsReceivedMu.Unlock()
+		if received > 1 {
+			// TODO: probably it will be good to log the error
+			return
+		}
+		handler(StreamEvent{Err: err})
+	}
+
+	otherHandlerInternal := func(se StreamEvent) {
+		errorsReceivedMu.RLock()
+		received := errorsReceived
+		errorsReceivedMu.RUnlock()
+
+		if received > 0 {
+			return
+		}
+		handler(se)
+	}
+
+	handlerInternal := func(se StreamEvent) {
+		switch {
+		case se.Err != nil:
+			errHandlerInternal(se.Err)
+		default:
+			otherHandlerInternal(se)
+		}
+	}
+	cancelInternal := openStreamManyErrors(handlerInternal)
+	return cancelInternal
+}
+
+// `OpenStreamWithAtMostOneError` in functional style
+func OpenStreamWithAtMostOneErrorFn(
+	openStreamManyErrors OpenStreamManyErrorsFunc,
+) OpenStreamFunc {
+	return func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		return OpenStreamWithAtMostOneError(openStreamManyErrors, h)
+	}
+}
+
+func OpenStreamWithCancelOnError(
+	openStream OpenStreamFunc,
+	handler func(StreamEvent),
+) (cancel chan<- struct{}) {
+	variablesMu := sync.RWMutex{}
+	isCanceled := false
+	var cancelInternal chan<- struct{}
+
+	cancelExternal := make(chan struct{})
+	stopGoroutine := make(chan struct{})
+
+	errHandlerInternal := func(err error) {
+		variablesMu.Lock()
+
+		if cancelInternal == nil || isCanceled {
+			// no-op
+		} else {
+			isCanceled = true
+			close(stopGoroutine)
+			close(cancelInternal)
+		}
+		variablesMu.Unlock()
+		handler(StreamEvent{Err: err})
+	}
+
+	handlerInternal := func(se StreamEvent) {
+		switch {
+		case se.Err != nil:
+			errHandlerInternal(se.Err)
+		default:
+			handler(se)
+		}
+	}
+	variablesMu.Lock()
+	cancelInternal = openStream(handlerInternal)
+	variablesMu.Unlock()
+
+	if cancelInternal != nil {
+		go func() {
+			select {
+			case <-cancelExternal:
+			case <-stopGoroutine:
+			}
+			variablesMu.Lock()
+			if !isCanceled {
+				isCanceled = true
+				close(cancelInternal)
+			}
+			variablesMu.Unlock()
+		}()
+		return cancelExternal
+	}
+	return nil
+}
+
+// `OpenStreamWithCancelOnError` in functional style
+func OpenStreamWithCancelOnErrorFn(
+	openStream OpenStreamFunc,
+) OpenStreamFunc {
+	return func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		return OpenStreamWithCancelOnError(openStream, h)
+	}
+}
+
+// The stream can be not closed after emitting error
+// `cancel` is nil if error is sent on opening.
+// `done` is nil if errors is sent on opening.
+// Error can be sent many times.
+// Handler can be called only after returning channels.
+type OpenStreamWithDoneFunc func(
+	handler func(StreamEvent),
+) (done <-chan struct{}, cancel chan<- struct{})
+
+func OpenStreamDoneIsError(
+	openStreamManyErrors OpenStreamWithDoneFunc,
+	handler func(StreamEvent),
+) (cancel chan<- struct{}) {
+	done, cancelInternal := openStreamManyErrors(handler)
+	if done != nil {
+		go func() {
+			<-done
+			handler(StreamEvent{Err: errors.New("stream was closed")})
+		}()
+	}
+	return cancelInternal
+}
+
+// `OpenStreamDoneIsError` in functional style
+func OpenStreamDoneIsErrorFn(
+	openStreamManyErrors OpenStreamWithDoneFunc,
+) OpenStreamManyErrorsFunc {
+	return func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		return OpenStreamDoneIsError(openStreamManyErrors, h)
+	}
+}
+
+// `openStream` should send at most one error and
+// it should be stopped after sending first error
+type StreamSubscriber struct {
+	mu               sync.RWMutex
+	topicsToHandlers map[string]map[chan<- StreamEvent]struct{}
+	openStream       OpenStreamFunc
+	cancel           chan<- struct{}
+}
+
+func NewStreamSubscriber(openStream OpenStreamFunc) *StreamSubscriber {
+	ss := &StreamSubscriber{
+		topicsToHandlers: make(map[string]map[chan<- StreamEvent]struct{}),
+		openStream:       openStream,
+	}
+	return ss
+}
+
+// `notif` channel will be not closed
+func (s *StreamSubscriber) Subscribe(
+	topic string, notif chan<- StreamEvent,
+) {
+	s.mu.Lock()
+	if len(s.topicsToHandlers) != 0 {
+		s.setTopicHandlerThreadUnsafe(topic, notif)
+		s.mu.Unlock()
+		return
+	}
+
+	s.setTopicHandlerThreadUnsafe(topic, notif)
+	s.mu.Unlock()
+
+	errHandler := func(err error) {
+		log.Printf("[StreamSubscriber] Subscribe/errHandler: %v", err)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.cancel = nil
+		for _, handlers := range s.topicsToHandlers {
+			for handler := range handlers {
+				handler <- StreamEvent{Err: err}
+			}
+		}
+		s.topicsToHandlers = make(map[string]map[chan<- StreamEvent]struct{})
+	}
+	connectedHandler := func() {
+		for _, handlers := range s.topicsToHandlers {
+			for handler := range handlers {
+				handler <- StreamEvent{Connected: true}
+			}
+		}
+	}
+	msgHandler := func(se StreamEvent) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		handlers := s.topicsToHandlers[se.Msg.Topic]
+		for handler := range handlers {
+			handler <- se
+		}
+	}
+
+	handler := func(se StreamEvent) {
+		switch {
+		case se.Err != nil:
+			errHandler(se.Err)
+		case se.Connected:
+			connectedHandler()
+		case se.Msg != nil:
+			msgHandler(se)
+		default:
+			panic("impossible")
+		}
+	}
+
+	go func() {
+		cancel := s.openStream(handler)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if len(s.topicsToHandlers) != 0 {
+			s.cancel = cancel
+			return
+		}
+		if cancel != nil {
+			close(cancel)
+		}
+	}()
+}
+
+// It's ok to call unsubscribe many times.
+func (s *StreamSubscriber) Unsubscribe(
+	topic string, notif chan<- StreamEvent,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	topicHandlers, ok := s.topicsToHandlers[topic]
+	if !ok {
+		return
+	}
+	delete(topicHandlers, notif)
+	if len(topicHandlers) == 0 {
+		delete(s.topicsToHandlers, topic)
+	}
+
+	if len(s.topicsToHandlers) == 0 {
+		if s.cancel != nil {
+			close(s.cancel)
+			s.cancel = nil
+		}
+	}
+}
+
+func (s *StreamSubscriber) setTopicHandlerThreadUnsafe(
+	topic string, notif chan<- StreamEvent,
+) {
+	if len(s.topicsToHandlers[topic]) == 0 {
+		s.topicsToHandlers[topic] = make(map[chan<- StreamEvent]struct{})
+	}
+	s.topicsToHandlers[topic][notif] = struct{}{}
+}

@@ -1,0 +1,410 @@
+package utils
+
+import (
+	"log"
+	"math"
+	"testing"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
+)
+
+func TestOpenStreamWithRetry(t *testing.T) {
+	log.Print("TestOpenStreamWithRetry")
+	start := time.Now()
+	attempt := atomic.Uint32{}
+	attempt.Store(0)
+	handlerCalled := atomic.Uint32{}
+
+	handler := func(se StreamEvent) {
+		handlerCalled.Inc()
+		log.Printf("handler-%v %v", handlerCalled.Load(), se)
+
+		assert.Nil(t, se.Err)
+
+		if handlerCalled.Load() == 1 {
+			assert.True(t, se.Connected)
+			return
+		}
+
+		assert.False(t, se.Connected)
+
+		assert.Equal(t, uint32(2), attempt.Load())
+
+		assert.Equal(t, "top2", se.Msg.Topic)
+		assert.Equal(t, "msg2", se.Msg.Value)
+	}
+	openStreamFunc1 := func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		assert.True(t, timeDistance(start, time.Now(), 0))
+		log.Print("openStreamFunc1")
+		attempt.Store(1)
+		time.Sleep(time.Second / 3)
+		h(StreamEvent{Err: errors.New("err1")})
+		return nil
+	}
+	openStreamFunc2 := func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		log.Print("openStreamFunc2")
+		assert.True(t, timeDistance(start, time.Now(), 2000/3))
+		attempt.Store(2)
+		go func() {
+			time.Sleep(time.Second / 3)
+			h(StreamEvent{Msg: &StreamEventMsg{"top2", "msg2"}})
+		}()
+		h(StreamEvent{Connected: true})
+		return make(chan<- struct{})
+	}
+	openStreamFunc := func(
+		h func(StreamEvent),
+	) (cancel chan<- struct{}) {
+		log.Print("openStreamFunc")
+		switch attempt.Load() {
+		case 0:
+			return openStreamFunc1(h)
+		case 1:
+			return openStreamFunc2(h)
+		}
+		assert.Fail(t, "openStreamFunc unexpected")
+		return nil
+	}
+	cancel := OpenStreamWithRetry(
+		5,
+		time.Second/3, time.Second/3,
+		handler, openStreamFunc)
+	assert.NotNil(t, cancel)
+	time.Sleep(5 * time.Second / 3)
+	assert.Equal(t, uint32(2), attempt.Load())
+	assert.Equal(t, uint32(2), handlerCalled.Load())
+}
+
+func TestOpenStreamWithRetryErrors(t *testing.T) {
+	log.Print("TestOpenStreamWithRetryErrors")
+	start := time.Now()
+	attempt := atomic.Uint32{}
+	attempt.Store(0)
+	handlerCalled := atomic.Uint32{}
+
+	handler := func(se StreamEvent) {
+		handlerCalled.Inc()
+		assert.Nil(t, se.Msg)
+
+		if handlerCalled.Load() == 1 {
+			assert.True(t, se.Connected)
+			return
+		}
+		assert.False(t, se.Connected)
+		switch attempt.Load() {
+		case 2:
+			assert.Equal(t, "err2", se.Err.Error())
+		default:
+			assert.Fail(t, "msg handler unexpected")
+		}
+	}
+	openStreamFunc1 := func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		assert.True(t, timeDistance(start, time.Now(), 0))
+		attempt.Store(1)
+		time.Sleep(time.Second / 3)
+		h(StreamEvent{Err: errors.New("err1")})
+		return nil
+	}
+	openStreamFunc2 := func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		assert.True(t, timeDistance(start, time.Now(), 2000/3))
+		attempt.Store(2)
+		go func() {
+			time.Sleep(time.Second / 3)
+			h(StreamEvent{Err: errors.New("err2")})
+		}()
+		h(StreamEvent{Connected: true})
+		return make(chan<- struct{})
+	}
+	openStreamFunc := func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		log.Print("openStreamFunc")
+		switch attempt.Load() {
+		case 0:
+			return openStreamFunc1(h)
+		case 1:
+			return openStreamFunc2(h)
+		}
+		assert.Fail(t, "openStreamFunc unexpected")
+		return nil
+	}
+	cancel := OpenStreamWithRetry(
+		2,
+		20*time.Second/3, time.Second/3,
+		handler, openStreamFunc)
+	assert.NotNil(t, cancel)
+	time.Sleep(5 * time.Second / 3)
+	assert.Equal(t, uint32(2), attempt.Load())
+	assert.Equal(t, uint32(2), handlerCalled.Load())
+}
+
+func TestOpenStreamWithRetryNilResult(t *testing.T) {
+	log.Print("TestOpenStreamWithRetryError")
+	start := time.Now()
+	attempt := atomic.Uint32{}
+	attempt.Store(0)
+
+	handler := func(se StreamEvent) {
+		assert.Equal(t, "err", se.Err.Error())
+	}
+	openStreamFunc := func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		assert.True(t, timeDistance(start, time.Now(), 0))
+		attempt.Inc()
+		h(StreamEvent{Err: errors.New("err")})
+		return nil
+	}
+	cancel := OpenStreamWithRetry(
+		1,
+		20*time.Second, time.Second,
+		handler, openStreamFunc)
+	assert.Nil(t, cancel)
+	assert.Equal(t, uint32(1), attempt.Load())
+}
+
+func TestOpenStreamWithRetryCleanAttemptsAndCancel(t *testing.T) {
+	log.Print("TestOpenStreamWithRetryCleanAttemptsAndCancel")
+	start := time.Now()
+	opens := atomic.Uint32{}
+	cancelInternal := make(chan struct{}, 1)
+
+	handler := func(se StreamEvent) {
+		assert.Nil(t, se.Err)
+		log.Print("se ", se)
+	}
+	openStreamFunc := func(
+		h func(StreamEvent),
+	) (cancel chan<- struct{}) {
+		log.Print("openStreamFunc")
+		assert.True(t, timeDistance(start, time.Now(), 1000*int64(opens.Load())))
+		opens.Inc()
+		go func() {
+			time.Sleep(time.Second / 3)
+			h(StreamEvent{Msg: &StreamEventMsg{"top", "msg"}})
+			time.Sleep(time.Second / 3)
+			log.Print("sending err2")
+			h(StreamEvent{Err: errors.New("err2")})
+		}()
+		return cancelInternal
+	}
+	cancel := OpenStreamWithRetry(
+		1,
+		time.Second/3, time.Second/3,
+		handler, openStreamFunc)
+	time.Sleep((3*2 + 1) * time.Second / 3)
+	cancel <- struct{}{}
+	<-cancelInternal
+	time.Sleep(5 * time.Second / 3)
+	log.Print("checking opens")
+	assert.Equal(t, uint32(3), opens.Load())
+}
+
+func TestOpenStreamWithAtMostOneError(t *testing.T) {
+	end := make(chan struct{}, 1)
+	cancelInternal := make(chan struct{}, 1)
+	open := func(
+		h func(StreamEvent),
+	) (cancel chan<- struct{}) {
+		go func() {
+			h(StreamEvent{Msg: &StreamEventMsg{"topic1", "msg1"}})
+			h(StreamEvent{Connected: true})
+			h(StreamEvent{Err: errors.New("err1")})
+			h(StreamEvent{Err: errors.New("err2")})
+			h(StreamEvent{Msg: &StreamEventMsg{"topic2", "msg2"}})
+			h(StreamEvent{Connected: true})
+			close(end)
+		}()
+		return cancelInternal
+	}
+	connecteds := atomic.NewInt32(0)
+	handler := func(se StreamEvent) {
+		switch {
+		case se.Err != nil:
+			assert.Equal(t, "err1", se.Err.Error())
+		case se.Msg != nil:
+			assert.Equal(t, "topic1", se.Msg.Topic)
+			assert.Equal(t, "msg1", se.Msg.Value)
+		case se.Connected:
+			connecteds.Inc()
+		}
+	}
+	cancel := OpenStreamWithAtMostOneError(open, handler)
+	close(cancelInternal)
+	<-end
+	assert.NotNil(t, cancel)
+	assert.Equal(t, int32(1), connecteds.Load())
+}
+
+func TestOpenStreamWithAtMostOneError_OpenErr(t *testing.T) {
+	end := make(chan struct{}, 1)
+	open := func(
+		h func(StreamEvent),
+	) (cancel chan<- struct{}) {
+		go func() {
+			h(StreamEvent{Err: errors.New("err1")})
+			h(StreamEvent{Err: errors.New("err2")})
+			close(end)
+		}()
+		return nil
+	}
+	handler := func(se StreamEvent) {
+		switch {
+		case se.Err != nil:
+			assert.Equal(t, "err1", se.Err.Error())
+		default:
+			assert.Fail(t, "fail")
+		}
+	}
+	cancel := OpenStreamWithAtMostOneError(open, handler)
+	<-end
+	assert.Nil(t, cancel)
+}
+
+func TestOpenStreamWithCancelOnError(t *testing.T) {
+	cancelInternal := make(chan struct{}, 1)
+	open := func(
+		h func(StreamEvent),
+	) (cancel chan<- struct{}) {
+		go func() {
+			h(StreamEvent{Connected: true})
+			h(StreamEvent{Msg: &StreamEventMsg{"topic1", "msg1"}})
+			h(StreamEvent{Err: errors.New("err")})
+		}()
+		return cancelInternal
+	}
+	connecteds := atomic.NewInt32(0)
+	handler := func(se StreamEvent) {
+		switch {
+		case se.Err != nil:
+			assert.Equal(t, "err", se.Err.Error())
+		case se.Msg != nil:
+			assert.Equal(t, "topic1", se.Msg.Topic)
+			assert.Equal(t, "msg1", se.Msg.Value)
+		case se.Connected:
+			connecteds.Inc()
+		}
+	}
+	cancel := OpenStreamWithCancelOnError(open, handler)
+	assert.NotNil(t, cancel)
+	assert.Eventually(t,
+		func() bool { <-cancelInternal; return true },
+		time.Second*3, time.Millisecond*100)
+	assert.Equal(t, int32(1), connecteds.Load())
+}
+
+func TestOpenStreamWithCancelOnError_ManualCancel(t *testing.T) {
+	cancelInternal := make(chan struct{}, 1)
+	open := func(
+		h func(StreamEvent),
+	) (cancel chan<- struct{}) {
+		go func() {
+			h(StreamEvent{Connected: true})
+			h(StreamEvent{Msg: &StreamEventMsg{"topic1", "msg1"}})
+		}()
+		return cancelInternal
+	}
+	connecteds := atomic.NewInt32(0)
+	handler := func(se StreamEvent) {
+		switch {
+		case se.Msg != nil:
+			assert.Equal(t, "topic1", se.Msg.Topic)
+			assert.Equal(t, "msg1", se.Msg.Value)
+		case se.Connected:
+			connecteds.Inc()
+		}
+	}
+	cancel := OpenStreamWithCancelOnError(open, handler)
+	assert.NotNil(t, cancel)
+	close(cancel)
+	assert.Eventually(t,
+		func() bool { <-cancelInternal; return true },
+		time.Second*3, time.Millisecond*100)
+	assert.Equal(t, int32(1), connecteds.Load())
+}
+
+func TestStreamSubscriber(t *testing.T) {
+	in := make(chan *StreamEventMsg)
+
+	open := func(h func(StreamEvent)) (cancel chan<- struct{}) {
+		go func() {
+			for {
+				h(StreamEvent{Msg: <-in})
+			}
+		}()
+		return make(chan<- struct{})
+	}
+	ss := NewStreamSubscriber(open)
+
+	s1_t1_ch := make(chan StreamEvent, 1)
+	ss.Subscribe("t1", s1_t1_ch)
+	in <- &StreamEventMsg{Topic: "t2", Value: "t2_msg1"}
+	in <- &StreamEventMsg{Topic: "t1", Value: "t1_msg1"}
+	assert.Equal(t, "t1_msg1", (<-s1_t1_ch).Msg.Value)
+
+	s2_t1_ch := make(chan StreamEvent, 1)
+	ss.Subscribe("t1", s2_t1_ch)
+	in <- &StreamEventMsg{Topic: "t2", Value: "t2_msg1"}
+	in <- &StreamEventMsg{Topic: "t1", Value: "t1_msg2"}
+	assert.Equal(t, "t1_msg2", (<-s1_t1_ch).Msg.Value)
+	assert.Equal(t, "t1_msg2", (<-s2_t1_ch).Msg.Value)
+
+	s1_t2_ch := make(chan StreamEvent, 1)
+	ss.Subscribe("t2", s1_t2_ch)
+	in <- &StreamEventMsg{Topic: "t2", Value: "t2_msg1"}
+	assert.Equal(t, "t2_msg1", (<-s1_t2_ch).Msg.Value)
+}
+
+func TestStreamSubscriber_Unsubscribe(t *testing.T) {
+	in := make(chan *StreamEventMsg, 1)
+	var cancel chan struct{}
+
+	enter, exit := make(chan struct{}, 1), make(chan struct{}, 1)
+
+	open := func(h func(StreamEvent)) (cancelReturn chan<- struct{}) {
+		go func() {
+			enter <- struct{}{}
+			for {
+				log.Print("waiting for event")
+				select {
+				case <-cancel:
+					log.Print("cancel received")
+					exit <- struct{}{}
+					return
+				case x := <-in:
+					log.Print("sending event: ", x)
+					h(StreamEvent{Msg: x})
+				}
+			}
+		}()
+		return cancel
+	}
+	ss := NewStreamSubscriber(open)
+	s1_t2_ch := make(chan StreamEvent, 1)
+	cancel = make(chan struct{})
+	ss.Subscribe("t2", s1_t2_ch)
+	<-enter
+
+	in <- &StreamEventMsg{Topic: "t2", Value: "t2_msg1"}
+	assert.Equal(t, "t2_msg1", (<-s1_t2_ch).Msg.Value)
+
+	ss.Unsubscribe("t2", s1_t2_ch)
+	<-exit
+
+	cancel = make(chan struct{})
+	ss.Subscribe("t2", s1_t2_ch)
+	<-enter
+
+	in <- &StreamEventMsg{Topic: "t2", Value: "t2_msg2"}
+	time.Sleep(time.Second)
+	assert.Equal(t, "t2_msg2", (<-s1_t2_ch).Msg.Value)
+
+	ss.Unsubscribe("t2", s1_t2_ch)
+	<-exit
+}
+
+// b-a ~= millis
+// 100 millis resolution
+func timeDistance(a, b time.Time, millis int64) bool {
+	unixMillisDist := (b.UnixNano() - a.UnixNano()) / 1000 / 1000
+	return math.Abs(float64(unixMillisDist-millis)) < 100
+}
